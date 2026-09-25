@@ -1,0 +1,15 @@
+# Ignore everything by default
+*
+
+# But un-ignore directories (required to traverse into subdirectories)
+!*/
+
+# But un-ignore .gitignore itself
+!.gitignore
+
+# Only track C source and header files
+!*.c
+!*.h
+
+# Assembly startup files (needed to build the project)
+!*.s
