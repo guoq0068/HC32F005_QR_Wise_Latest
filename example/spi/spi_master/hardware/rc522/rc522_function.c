@@ -1215,7 +1215,13 @@ char DealWithCard(u8* UID) {
 	Wdt_Feed();
 
 	if (result != MI_OK) {
-		DEBUG("result is not ok");
+		/* 认证失败：卡密钥非默认 0xFFFFFFFF（或密钥 A 不可用）。
+		 * 原先直接 return，不向 HC32 上报，表现为刷卡完全无反应；
+		 * 现上报非法卡事件，使主机端能给出报警提示。 */
+		DEBUG("auth fail");
+		buf[0] = GUNMA_IC_VERIFY_RESULT_FAIL_INVALID_CARD;
+		buf[1] = INVALID_CARD_AUTH_FAIL;
+		gunmaProtocol_Send(GUNMA_CMD_IC_VERIFY_RESULT, buf, 2);
 		return MI_ERR;
 	}
 

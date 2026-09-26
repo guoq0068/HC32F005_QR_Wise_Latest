@@ -49,7 +49,8 @@ typedef enum {
     INVALID_CARD_WRITE_0_SECTOR = 1,  // 能写0扇区得卡，uid，cuid等
     INVALID_CARD_BACK_DOOR, 					// 后门卡
     INVALID_CARD_NFC_CPU,   						// cpu卡
-    INVALID_CARD_7_UID								// 7位UID
+    INVALID_CARD_7_UID,							// 7位UID
+    INVALID_CARD_AUTH_FAIL						// 密钥认证失败，卡密钥非默认0xFFFFFFFF
 } InValidCardType;
 
 typedef enum {
