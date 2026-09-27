@@ -9,7 +9,18 @@ unsigned char  data1[16] = { 0x01,0x00,0x00,0x00,0xFE,0xFF,0xFF,0xFF,0x01,0x00,0
 //M1卡的某一块写为如下格式，则该块为钱包，可接收扣款和充值命令
 //4字节金额（低字节在前）＋4字节金额取反＋4字节金额＋1字节块地址＋1字节块地址取反＋1字节块地址＋1字节块地址取反 
 unsigned char  data2[4] = { 0x01,0,0,0 };//充值金额
-unsigned char  DefaultKey[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+/* 扇区密钥：扇区 0 与其它扇区各用一组。
+ * 原为全 0xFFFFFFFF，现按卡实际密钥改为下面两组。 */
+unsigned char  Sector0Key[6] = { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5 };
+unsigned char  DefaultKey[6] = { 0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7 };
+unsigned char  AllFFKey[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+/* 卡类型标志：由 Check_By_Writing_Block0 在探测块 0 时确定。
+ *   0 = 尚未探测
+ *   1 = 扇区 0 密钥为全 0xFFFFFFFF —— 所有扇区均用 AllFFKey（老卡）
+ *   2 = 扇区 0 密钥为 A0A1A2A3A4A5 —— 扇区 0 用 Sector0Key，
+ *       其余扇区用 DefaultKey(D3F7D3F7D3F7)（新卡） */
+unsigned char  g_cardKeyMode = 0;
 unsigned char g_ucTempbuf[32];    //备份的钱包
 unsigned char status, i;
 unsigned int temp;
@@ -25,6 +36,14 @@ int exti_t = 1;
 
 uint32_t Get_SysTick(void);
 char PcdComMF522(u8 ucCommand, u8* pInData, u8 ucInLenByte, u8* pOutData, u32* pOutLenBit);
+u8*  GetCardKey(u8 ucAddr);
+char PcdHalt(void);
+char PcdRequest(u8 ucReq_code, u8* pTagType);
+char PcdAnticoll(u8* pSnr);
+char PcdSelect(u8* pSnr);
+void PcdAntennaOff(void);
+void PcdAntennaOn(void);
+char RebuildCardSession(u8* pSnr);
 void CalulateCRC(u8* pIndata, u8 ucLen, u8* pOutData);
 
 extern GunMaSettingType gGunmaSetting;
@@ -601,6 +620,73 @@ uint8_t Safe_Write_UID_Backdoor() {
 	return 0;
 }
 
+/*
+ * @brief 按块地址与已探测到的卡类型，返回该块应使用的密钥。
+ *
+ * g_cardKeyMode 由 Check_By_Writing_Block0 认证块 0 时确定：
+ *   1 = 老卡：所有扇区均为全 0xFFFFFFFF
+ *   2 = 新卡：扇区 0 为 A0A1A2A3A4A5，其余扇区为 D3F7D3F7D3F7
+ *   0 = 尚未探测（理论上不会走到，兜底按老卡处理）
+ *
+ * @param ucAddr 目标块地址，扇区号 = ucAddr / 4
+ * @return 该块应使用的 6 字节密钥
+ */
+u8* GetCardKey(u8 ucAddr) {
+	if (g_cardKeyMode == 2) {
+		return (ucAddr / 4 == 0) ? Sector0Key : DefaultKey;
+	}
+	/* 模式 1（老卡）及未探测的兜底情况 */
+	return AllFFKey;
+}
+
+/*
+ * @brief 重建卡片会话（用于认证失败后）。
+ *
+ * M1 卡在一次认证失败后会进入短暂锁定，此时仅复位 RC522 寄存器不够：
+ * 卡片自身仍停留在异常会话中，必须让它退回 IDLE 再重新选卡。
+ * 注意不能只发 PcdAnticoll —— 卡片处于 ACTIVE 态时不响应防冲突命令，
+ * 必须先 PcdHalt 使其离开 ACTIVE 态，并配合 RF 场复位。
+ * 该流程与 CS() 正式读卡前的复位保持一致（已实卡验证可行）。
+ *
+ * @param pSnr 输入/输出：卡片 4 字节序列号（重新选卡后保持不变）
+ * @return MI_OK 会话已重建，可认证；MI_ERR 卡片已离开或无法重新选中
+ */
+char RebuildCardSession(u8* pSnr) {
+	u8 atqa[2];
+	u8 localUid[4];
+
+	/* 1. 让卡片退出 ACTIVE 态，否则后续防冲突命令无响应 */
+	PcdHalt();
+	delay1ms(10);
+
+	/* 2. RF 场复位：天线关→开，强制卡片重置状态机 */
+	PcdAntennaOff();
+	delay1ms(10);
+	PcdAntennaOn();
+	delay1ms(10);
+	Wdt_Feed();
+
+	/* 3. 重新寻卡 */
+	if (PcdRequest(PICC_REQALL, atqa) != MI_OK) {
+		return MI_ERR;
+	}
+
+	/* 4. 防冲撞取得 UID，并确认仍是同一张卡 */
+	if (PcdAnticoll(localUid) != MI_OK) {
+		return MI_ERR;
+	}
+	if (memcmp(pSnr, localUid, 4) != 0) {
+		return MI_ERR;
+	}
+
+	/* 5. 选卡，进入可认证状态 */
+	if (PcdSelect(pSnr) == MI_ERR) {
+		return MI_ERR;
+	}
+
+	return MI_OK;
+}
+
 /**
  * @brief 通过尝试修改 Block 0 来检测 CUID 类型复制卡
  * @param pUID: 选卡得到的 4 字节 UID
@@ -610,12 +696,29 @@ uint8_t Check_By_Writing_Block0(u8* pUID) {
 	u8 status;
 	u8 block0_data[16];
 	u8 test_data[16];
-	// 大部分 CUID 卡出厂默认密钥是全 0xFF
-	u8 defaultKey[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+	// 1. 认证 0 块 (Sector 0)，同时探测本卡扇区 0 的密钥属于哪一套。
+	// 必须先经过 PcdSelect 选中卡片后才能认证。
+	// 顺序：先试全 0xFFFFFFFF（老卡），失败再试 A0 组（新卡）。
+	status = PcdAuthState(PICC_AUTHENT1A, 0, AllFFKey, pUID);
+	if (status == MI_OK) {
+		g_cardKeyMode = 1;   /* 老卡：所有扇区都用全 FF */
+		DEBUG("key probe: AllFF\n");
+	} else {
+		/* 全 FF 失败：认证失败会让卡片进入短暂锁定，
+		 * 仅复位 RC522 寄存器不够，必须先重建卡片会话再试 A0 组，
+		 * 否则第二次认证也会失败，导致探测无法识别新卡。 */
+		if (RebuildCardSession(pUID) == MI_OK) {
+			status = PcdAuthState(PICC_AUTHENT1A, 0, Sector0Key, pUID);
+			if (status == MI_OK) {
+				g_cardKeyMode = 2;   /* 新卡：扇区0用A0组，其余用D3组 */
+				DEBUG("key probe: A0 series\n");
+			}
+		} else {
+			/* 卡片已离开或无法重新选中 */
+			DEBUG("key probe: rebuild fail\n");
+		}
+	}
 
-	// 1. 认证 0 块 (Sector 0)
-	// 必须先经过 PcdSelect 选中卡片后才能认证
-	status = PcdAuthState(PICC_AUTHENT1A, 0, defaultKey, pUID);
 	if (status != MI_OK) {
 		//DEBUG("#check1 %d\n", status);
 		// 关键修复：认证失败时，M1卡进入死锁状态+RC522的Crypto1On可能被置位
@@ -1071,7 +1174,7 @@ void DealWithNewGunma(u8 newGunma, u8 oldGunma) {
 			if (PcdSelect(active_uid) != MI_ERR) {
 				DEBUG("pchalt 5");
 				// 重新认证目标地址
-				if (PcdAuthState(PICC_AUTHENT1A, addr, DefaultKey, active_uid) == MI_OK) {
+				if (PcdAuthState(PICC_AUTHENT1A, addr, GetCardKey(addr), active_uid) == MI_OK) {
 					// 此时再调用 PcdWrite
 					Wdt_Feed();
 					result = PcdWrite(addr, (u8*)(&gIcSectorBuf.block[blockIndex]));
@@ -1101,7 +1204,7 @@ void DealWithNewGunma(u8 newGunma, u8 oldGunma) {
 		if (PcdRequest(PICC_REQALL, g_ucTempbuf) == MI_OK) {
 			if (PcdAnticoll(active_uid) == MI_OK) {
 				if (PcdSelect(active_uid) != MI_ERR) {
-					if (PcdAuthState(PICC_AUTHENT1A, addr, DefaultKey, active_uid) == MI_OK) {
+					if (PcdAuthState(PICC_AUTHENT1A, addr, GetCardKey(addr), active_uid) == MI_OK) {
 						// 授权成功，执行写入（带内部重试）
 						int write_retry = 3;
 						int write_ok_but_mismatch = 0;
@@ -1211,7 +1314,7 @@ char DealWithCard(u8* UID) {
 	gGunamICState = GUNMA_IC_STATE_SENDING_IC_CARD;
 	DEBUG("%02x %02x %02x %02x %d\n", UID[0], UID[1], UID[2], UID[3], addr);
 
-	result = PcdAuthState(PICC_AUTHENT1A, addr, DefaultKey, UID);
+	result = PcdAuthState(PICC_AUTHENT1A, addr, GetCardKey(addr), UID);
 	Wdt_Feed();
 
 	if (result != MI_OK) {
